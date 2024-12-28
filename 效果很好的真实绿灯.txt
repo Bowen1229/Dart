@@ -1,0 +1,200 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <cmath>
+
+// 记录上一次目标的位置
+cv::Point2f previousCenter(-1, -1);
+cv::Point2f currentCenter(-1, -1);  // 当前锁定的目标位置
+bool targetLocked = false;  // 标志是否锁定了目标
+int stableFrameCount = 0;  // 记录连续稳定帧的数量
+const int stabilityThreshold = 5;  // 需要连续5帧稳定才算锁定目标
+
+// 函数：图像预处理，使用 HSV 颜色空间识别带有绿色发光轮廓的白色光
+cv::Mat preprocessImage(const cv::Mat& inputImage, double brightnessFactor) {
+    // 降低图像亮度
+    cv::Mat darkenedImage;
+    inputImage.convertTo(darkenedImage, CV_32F);
+    darkenedImage *= brightnessFactor;
+    darkenedImage.convertTo(darkenedImage, CV_8U);
+
+    // 转换为 HSV 颜色空间
+    cv::Mat hsvImage;
+    cv::cvtColor(darkenedImage, hsvImage, cv::COLOR_BGR2HSV);
+
+    // 分离 HSV 通道
+    std::vector<cv::Mat> hsvChannels(3);
+    cv::split(hsvImage, hsvChannels);
+    cv::Mat hChannel = hsvChannels[0];  // 色相通道
+    cv::Mat sChannel = hsvChannels[1];  // 饱和度通道
+    cv::Mat vChannel = hsvChannels[2];  // 亮度通道
+
+    // 1. 检测白色光区域：V通道的亮度要高，S通道要低（白色没有饱和色）
+    cv::Mat whiteMask;
+    cv::inRange(vChannel, 200, 255, whiteMask);  // 亮度阈值
+    cv::inRange(sChannel, 0, 60, whiteMask);    // 饱和度低，排除彩色区域
+
+    // 2. 检测绿色边缘区域：绿色的色相范围大致是 [35, 85]，并且V值应该高
+    cv::Mat greenMask;
+    cv::inRange(hChannel, 40, 80, greenMask);   // 严格的绿色色相范围
+    cv::inRange(vChannel, 100, 255, greenMask); // V通道高亮度
+
+    // 将白色光和绿色边缘结合
+    cv::Mat combinedMask = whiteMask & greenMask;
+
+    // 形态学操作去除噪声
+    cv::morphologyEx(combinedMask, combinedMask, cv::MORPH_OPEN, cv::Mat(), cv::Point(-1, -1), 1); // 开运算
+    cv::morphologyEx(combinedMask, combinedMask, cv::MORPH_CLOSE, cv::Mat(), cv::Point(-1, -1), 1); // 闭运算
+
+    return combinedMask;
+}
+
+// 函数：轮廓检测并判断是否为圆形或椭圆形，绘制固定坐标轴并显示物体坐标
+void processContours(cv::Mat& inputImage, const cv::Mat& mask) {
+    // 查找轮廓
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // 图像中心
+    cv::Point imageCenter(inputImage.cols / 2, inputImage.rows / 2);
+
+    // 绘制固定的坐标轴，使用更长的红色细线
+    int axisLength = std::max(inputImage.cols, inputImage.rows) * 2; // 坐标轴长度设为图像尺寸的两倍
+    cv::Scalar axisColor(0, 0, 255); // 红色
+    int axisThickness = 1; // 线条厚度
+
+    cv::line(inputImage, cv::Point(imageCenter.x - axisLength, imageCenter.y),
+             cv::Point(imageCenter.x + axisLength, imageCenter.y), axisColor, axisThickness);
+    cv::line(inputImage, cv::Point(imageCenter.x, imageCenter.y - axisLength),
+             cv::Point(imageCenter.x, imageCenter.y + axisLength), axisColor, axisThickness);
+
+    // 如果检测到多个轮廓，选择最符合要求的目标
+    if (contours.size() > 1) {
+        double maxCircularity = 0;
+        int targetIndex = -1;
+
+        // 遍历所有轮廓，选择最符合要求的目标
+        for (int i = 0; i < contours.size(); ++i) {
+            if (contours[i].size() >= 5) {
+                // 拟合椭圆
+                cv::RotatedRect fittedEllipse = cv::fitEllipse(contours[i]);
+
+                // 面积和周长
+                double area = cv::contourArea(contours[i]);
+                double perimeter = cv::arcLength(contours[i], true);
+
+                // 计算圆度，要求圆度接近1，且面积适中
+                double circularity = (4 * CV_PI * area) / (perimeter * perimeter);
+                if (circularity > 0.6 && area > 100 && area < 1000) { // 放宽圆度要求，支持椭圆形目标
+                    if (circularity > maxCircularity) {
+                        maxCircularity = circularity;
+                        targetIndex = i;
+                    }
+                }
+            }
+        }
+
+        // 如果找到了符合要求的目标，继续处理
+        if (targetIndex == -1) {
+            std::cout << "Warning: No valid target found!" << std::endl;
+            return;
+        }
+
+        // 只处理选择的目标轮廓
+        contours = {contours[targetIndex]} ;
+    } else if (contours.size() == 0) {
+        std::cout << "No target detected!" << std::endl;
+        return;
+    }
+
+    // 如果已经锁定目标，继续追踪上次锁定的目标
+    if (targetLocked) {
+        // 只处理上次锁定的目标
+        for (const auto& contour : contours) {
+            if (contour.size() >= 5) {
+                cv::RotatedRect fittedEllipse = cv::fitEllipse(contour);
+                cv::Point2f ellipseCenter = fittedEllipse.center;
+
+                // 判断目标是否丢失（位置变化过大）
+                if (cv::norm(ellipseCenter - previousCenter) > 50) {
+                    std::cout << "Target has moved too quickly or disappeared!" << std::endl;
+                    targetLocked = false;  // 目标丢失，重新开始识别
+                    return;
+                }
+
+                // 更新目标位置
+                previousCenter = ellipseCenter;
+
+                // 计算相对于屏幕中心的坐标
+                int targetX = ellipseCenter.x - imageCenter.x;
+                int targetY = imageCenter.y - ellipseCenter.y;
+
+                // 输出目标坐标信息
+                std::cout << "Locked Target Position: (" << targetX << ", " << targetY << ")" << std::endl;
+
+                // 绘制目标信息
+                cv::circle(inputImage, ellipseCenter, 3, cv::Scalar(0, 0, 255), -1);
+                cv::ellipse(inputImage, fittedEllipse, cv::Scalar(0, 0, 255), 2);
+
+                // 如果连续几帧都识别到目标，则确认锁定
+                stableFrameCount++;
+                if (stableFrameCount > stabilityThreshold) {
+                    std::cout << "Target stable, lock confirmed!" << std::endl;
+                }
+
+                // 在图像上显示目标坐标
+                std::string text = "Target Position: (" + std::to_string(targetX) + ", " + std::to_string(targetY) + ")";
+                cv::putText(inputImage, text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+            }
+        }
+    } else {
+        // 如果没有锁定目标，尝试选择一个新的目标
+        for (const auto& contour : contours) {
+            if (contour.size() >= 5) {
+                cv::RotatedRect fittedEllipse = cv::fitEllipse(contour);
+                cv::Point2f ellipseCenter = fittedEllipse.center;
+
+                // 锁定目标
+                previousCenter = ellipseCenter;
+                targetLocked = true;
+                stableFrameCount = 1;  // 从第一帧开始稳定计数
+
+                std::cout << "New Target Locked: (" << ellipseCenter.x << ", " << ellipseCenter.y << ")" << std::endl;
+
+                // 绘制目标信息
+                cv::circle(inputImage, ellipseCenter, 3, cv::Scalar(0, 0, 255), -1);
+                cv::ellipse(inputImage, fittedEllipse, cv::Scalar(0, 0, 255), 2);
+            }
+        }
+    }
+}
+
+int main() {
+    // 打开视频流
+    cv::VideoCapture capture(0); // 摄像头索引为 0
+    if (!capture.isOpened()) {
+        std::cerr << "Error: Could not open camera." << std::endl;
+        return -1;
+    }
+
+    while (true) {
+        cv::Mat frame;
+        capture >> frame; // 获取一帧图像
+        if (frame.empty()) break;  // 如果视频结束或无法读取帧
+
+        // 预处理图像
+        cv::Mat mask = preprocessImage(frame, 0.7);
+
+        // 处理轮廓并显示目标
+        processContours(frame, mask);
+
+        // 显示处理后的图像
+        cv::imshow("Target Detection", frame);
+
+        // 按 'q' 键退出
+        if (cv::waitKey(1) == 'q') break;
+    }
+
+    capture.release();
+    cv::destroyAllWindows();
+    return 0;
+}
